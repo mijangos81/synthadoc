@@ -171,6 +171,27 @@ def test_append_to_index_creates_recently_added(tmp_wiki):
     assert "[[new-page]]" in content
 
 
+def test_append_to_index_inserts_under_recently_added_not_end(tmp_wiki):
+    """New entries must land inside ## Recently Added, even when another section
+    sits below it. Regression: previously appended to the end of the file, so a
+    trailing section (e.g. a topic cluster) silently absorbed every new page."""
+    store = WikiStorage(tmp_wiki / "wiki")
+    index_path = tmp_wiki / "wiki" / "index.md"
+    index_path.write_text(
+        "---\ntitle: Index\n---\n\n"
+        "## Recently Added\n\n"
+        "## Effective Population Size\n- [[existing]] — Existing\n",
+        encoding="utf-8")
+    store.write_page("new-page", WikiPage(title="New Page", tags=[], content="",
+                     status="active", confidence="medium", sources=[]))
+    store.append_to_index("new-page", "New Page")
+    lines = index_path.read_text(encoding="utf-8").splitlines()
+    ra = lines.index("## Recently Added")
+    trailing = lines.index("## Effective Population Size")
+    new_idx = next(i for i, line in enumerate(lines) if "[[new-page]]" in line)
+    assert ra < new_idx < trailing, "new entry must sit inside ## Recently Added, not after the trailing section"
+
+
 def test_concurrent_writes_to_different_pages(tmp_wiki):
     """Concurrent writes to different slugs must not interfere with each other."""
     store = WikiStorage(tmp_wiki / "wiki")
