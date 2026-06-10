@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Paul Chen / axoviq.com
+import asyncio
 import pytest
 from unittest.mock import AsyncMock
 from synthadoc.agents.lint_agent import LintAgent, LintReport, find_orphan_slugs, _fix_dangling_wikilinks, LINT_SKIP_SLUGS, LINT_SKIP_SOURCE_SLUGS, _parse_adversarial_response, _check_page_citations, read_current_lint_state
@@ -383,20 +384,20 @@ async def test_adversarial_pass_no_warnings_on_clean_page(tmp_wiki):
 
 
 @pytest.mark.asyncio
-async def test_adversarial_pass_rate_limit_is_non_fatal(tmp_wiki):
+async def test_adversarial_pass_retries_then_succeeds(tmp_wiki, monkeypatch):
+    """A transient 429 (concurrency burst, not quota) is retried with backoff;
+    the page still receives its real warning rather than a skip."""
+    monkeypatch.setattr("synthadoc.agents.lint_agent._ADV_BACKOFF_BASE", 0.0)
     store = WikiStorage(tmp_wiki / "wiki")
-    store.write_page("p1", WikiPage(
-        title="P1", tags=[], content="Claim one.",
-        status="active", confidence="high", sources=[]))
-    store.write_page("p2", WikiPage(
-        title="P2", tags=[], content="Claim two.",
+    store.write_page("p", WikiPage(
+        title="P", tags=[], content="Claim one.",
         status="active", confidence="high", sources=[]))
     log = LogWriter(tmp_wiki / "wiki" / "log.md")
     adv_provider = AsyncMock()
     adv_provider.complete.side_effect = [
         Exception("429 Too Many Requests"),
         CompletionResponse(
-            text='[{"claim": "Claim two.", "concern": "Unsupported"}]',
+            text='[{"claim": "Claim one.", "concern": "Unsupported"}]',
             input_tokens=50, output_tokens=20,
         ),
     ]
@@ -404,19 +405,67 @@ async def test_adversarial_pass_rate_limit_is_non_fatal(tmp_wiki):
         provider=AsyncMock(), store=store, log_writer=log,
         adversarial_provider=adv_provider,
     )
-    report = await agent.lint(adversarial=True)
-    all_warnings = [
-        w
-        for slug in ["p1", "p2"]
-        for p in [store.read_page(slug)] if p is not None
-        for w in (p.lint_warnings or [])
-    ]
-    claims = {w["claim"] for w in all_warnings}
-    # list_pages() order is filesystem-dependent (inode order on macOS), so assert
-    # on the set of outcomes rather than which slug got which call.
-    assert None in claims
-    assert any("rate limit" in (w["concern"] or "") for w in all_warnings)
-    assert "Claim two." in claims
+    await agent.lint(adversarial=True)
+    page = store.read_page("p")
+    assert page is not None
+    assert page.lint_warnings == [{"claim": "Claim one.", "concern": "Unsupported"}]
+    assert adv_provider.complete.call_count == 2  # retried once after the 429
+
+
+@pytest.mark.asyncio
+async def test_adversarial_pass_skips_after_exhausting_retries(tmp_wiki, monkeypatch):
+    """Persistent 429s past the retry budget downgrade to a non-fatal skip marker."""
+    monkeypatch.setattr("synthadoc.agents.lint_agent._ADV_BACKOFF_BASE", 0.0)
+    store = WikiStorage(tmp_wiki / "wiki")
+    store.write_page("p1", WikiPage(
+        title="P1", tags=[], content="Claim one.",
+        status="active", confidence="high", sources=[]))
+    log = LogWriter(tmp_wiki / "wiki" / "log.md")
+    adv_provider = AsyncMock()
+    adv_provider.complete.side_effect = Exception("429 Too Many Requests")
+    agent = LintAgent(
+        provider=AsyncMock(), store=store, log_writer=log,
+        adversarial_provider=adv_provider,
+    )
+    await agent.lint(adversarial=True)
+    page = store.read_page("p1")
+    assert page is not None
+    assert page.lint_warnings[0]["claim"] is None
+    assert "rate limit" in page.lint_warnings[0]["concern"]
+
+
+@pytest.mark.asyncio
+async def test_adversarial_pass_bounds_concurrency(tmp_wiki, monkeypatch):
+    """The pass never runs more than _ADV_CONCURRENCY adversarial calls at once,
+    so a large wiki does not burst the provider into a rate limit."""
+    monkeypatch.setattr("synthadoc.agents.lint_agent._ADV_CONCURRENCY", 3)
+    store = WikiStorage(tmp_wiki / "wiki")
+    for i in range(12):
+        store.write_page(f"p{i}", WikiPage(
+            title=f"P{i}", tags=[], content=f"Claim {i}.",
+            status="active", confidence="high", sources=[]))
+    log = LogWriter(tmp_wiki / "wiki" / "log.md")
+
+    inflight = 0
+    max_inflight = 0
+
+    async def tracker(*args, **kwargs):
+        nonlocal inflight, max_inflight
+        inflight += 1
+        max_inflight = max(max_inflight, inflight)
+        await asyncio.sleep(0.01)
+        inflight -= 1
+        return CompletionResponse(text="[]", input_tokens=5, output_tokens=1)
+
+    adv_provider = AsyncMock()
+    adv_provider.complete.side_effect = tracker
+    agent = LintAgent(
+        provider=AsyncMock(), store=store, log_writer=log,
+        adversarial_provider=adv_provider,
+    )
+    await agent.lint(adversarial=True)
+    assert max_inflight <= 3
+    assert adv_provider.complete.call_count == 12
 
 
 @pytest.mark.asyncio

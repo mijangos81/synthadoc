@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json as _json
 import re
@@ -55,6 +56,15 @@ LINT_SKIP_SOURCE_SLUGS: frozenset[str] = frozenset(
 LINT_SKIP_SLUGS: frozenset[str] = frozenset(
     {"index", "log", "dashboard", "purpose", "overview"}
 )
+
+# Adversarial pass concurrency + retry. The pass fires one LLM call per page; an
+# unbounded fan-out makes a large wiki burst every call at once and trip the
+# provider's per-minute rate limit. That 429 is transient (a burst, not quota
+# exhaustion), so we cap concurrency to avoid it and retry with exponential
+# backoff before downgrading to a non-fatal skip marker.
+_ADV_CONCURRENCY: int = 4          # max simultaneous adversarial calls
+_ADV_MAX_RETRIES: int = 4          # retries after a rate-limit 429 before skipping
+_ADV_BACKOFF_BASE: float = 1.0     # seconds; sleep = base * 2**attempt (1, 2, 4, 8 s)
 
 
 # Matches a list item whose first significant content is a single wikilink,
@@ -250,8 +260,16 @@ class LintAgent:
                 fixed += 1
         return fixed
 
-    async def _adversarial_single(self, slug: str, content: str) -> tuple[list[dict], int]:
-        """Adversarially review one page. Always returns; never raises (rate-limits are caught)."""
+    async def _adversarial_single(self, slug: str, content: str,
+                                  sem: "asyncio.Semaphore | None" = None) -> tuple[list[dict], int]:
+        """Adversarially review one page. Always returns; never raises.
+
+        A rate-limit (429) here is almost always a transient concurrency burst,
+        not quota exhaustion, so retry with exponential backoff before giving up.
+        ``sem`` bounds how many calls run at once so the burst is avoided in the
+        first place; it is released during backoff sleeps so other pages proceed.
+        Non-rate-limit errors are swallowed (return no warnings).
+        """
         n = self._adversarial_max_per_page
         prompt = (
             "You are a skeptical editor reviewing a wiki page compiled from source documents.\n\n"
@@ -266,18 +284,31 @@ class LintAgent:
             '[{"claim": "...", "concern": "..."}, ...]\n\n'
             f"--- PAGE CONTENT ---\n{content[:3000]}"
         )
-        try:
-            resp = await self._adversarial_provider.complete(
-                messages=[Message(role="user", content=prompt)],
-                temperature=0.0,
-            )
-            return _parse_adversarial_response(resp.text), resp.total_tokens
-        except Exception as exc:
+
+        def _is_rate_limit(exc: Exception) -> bool:
             err = str(exc).lower()
-            if "429" in str(exc) or "rate limit" in err or "rate_limit" in err or "too many" in err:
-                return [{"claim": None,
-                         "concern": "adversarial-pass-skipped: rate limit — consider a paid model or a higher rate-limit tier"}], 0
-            return [], 0
+            return ("429" in str(exc) or "rate limit" in err
+                    or "rate_limit" in err or "too many" in err)
+
+        guard = sem if sem is not None else contextlib.nullcontext()
+        for attempt in range(_ADV_MAX_RETRIES + 1):
+            try:
+                async with guard:
+                    resp = await self._adversarial_provider.complete(
+                        messages=[Message(role="user", content=prompt)],
+                        temperature=0.0,
+                    )
+                return _parse_adversarial_response(resp.text), resp.total_tokens
+            except Exception as exc:
+                if _is_rate_limit(exc) and attempt < _ADV_MAX_RETRIES:
+                    await asyncio.sleep(_ADV_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                if _is_rate_limit(exc):
+                    _log.warning("adversarial pass skipped for %s after %d retries: rate limit",
+                                 slug, _ADV_MAX_RETRIES)
+                    return [{"claim": None,
+                             "concern": "adversarial-pass-skipped: rate limit — consider a paid model or a higher rate-limit tier"}], 0
+                return [], 0
 
     async def _run_adversarial_pass(self, slugs: list[str]) -> tuple[list[dict], int]:
         """Concurrent adversarial review of all non-skip pages.
@@ -294,8 +325,9 @@ class LintAgent:
         if not scan:
             return [], 0
 
+        sem = asyncio.Semaphore(_ADV_CONCURRENCY)
         results = await asyncio.gather(
-            *(self._adversarial_single(s, p.content) for s, p in scan)
+            *(self._adversarial_single(s, p.content, sem) for s, p in scan)
         )
 
         all_warnings: list[dict] = []
