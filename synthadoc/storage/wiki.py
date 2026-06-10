@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Paul Chen / axoviq.com
 from __future__ import annotations
 
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -13,6 +14,34 @@ from filelock import FileLock
 
 _FRONTMATTER_FIELDS = ("title", "tags", "status", "confidence", "created", "sources", "orphan", "categories",
                        "aliases", "contradiction_note", "unresolved_note", "lint_warnings")
+
+
+def normalize_tag(tag: str) -> str:
+    """Coerce a tag to an Obsidian-valid token: lowercase kebab-case, no spaces
+    or punctuation.
+
+    Obsidian only accepts space/punctuation-free tags and renders the rest as
+    invalid (strikethrough) in the Properties panel. Generated multi-word tags
+    like ``population genetics`` or ``Ne/N ratio`` must become
+    ``population-genetics`` / ``ne-n-ratio``.
+    """
+    t = str(tag).strip().lower().replace("'", "")
+    # Keep word characters (Unicode letters/digits/underscore — Obsidian allows
+    # non-ASCII tags like 中文) and hyphens; collapse everything else to a hyphen.
+    t = re.sub(r"[^\w-]+", "-", t)
+    t = re.sub(r"-{2,}", "-", t)
+    return t.strip("-")
+
+
+def normalize_tags(tags) -> list[str]:
+    """Normalise a list of tags to valid kebab-case, dropping empties and
+    duplicates (order-preserving)."""
+    out: list[str] = []
+    for tag in tags or []:
+        slug = normalize_tag(tag)
+        if slug and slug not in out:
+            out.append(slug)
+    return out
 
 
 class LifecycleState:
@@ -116,7 +145,7 @@ class WikiStorage:
             page = page_or_content
             fm: dict = {
                 "title": page.title,
-                "tags": page.tags,
+                "tags": normalize_tags(page.tags),
                 "status": page.status,
                 "confidence": page.confidence,
                 "created": page.created,
