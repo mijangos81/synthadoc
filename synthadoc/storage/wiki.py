@@ -15,6 +15,48 @@ _FRONTMATTER_FIELDS = ("title", "tags", "status", "confidence", "created", "sour
                        "aliases", "contradiction_note", "unresolved_note", "lint_warnings")
 
 
+def insert_index_entries(index_path: Path, entries: list[tuple[str, str]]) -> list[str]:
+    """Insert ``- [[slug]] — title`` lines into index.md under ``## Recently Added``.
+
+    Each entry is inserted *inside* the Recently Added section (created at the end
+    of the file if absent) — never appended to the end of the document, where a
+    trailing section would silently absorb every new page. Slugs already linked
+    anywhere in the index are skipped (dedupe across re-ingest / promote).
+
+    Single source of truth for both the ingest path (``WikiStorage.append_to_index``)
+    and the candidates/promote path (``cli.candidates._add_to_index``). Returns the
+    slugs that were actually inserted.
+    """
+    if not index_path.exists() or not entries:
+        return []
+    text = index_path.read_text(encoding="utf-8")
+    fresh = [(slug, title) for slug, title in entries
+             if f"[[{slug}]]" not in text and f"[[{slug}|" not in text]
+    if not fresh:
+        return []
+    new_lines = [f"- [[{slug}]] — {title}" for slug, title in fresh]
+    if "## Recently Added" in text:
+        lines = text.splitlines()
+        insert_at = len(lines)
+        in_section = False
+        for i, line in enumerate(lines):
+            if line.strip() == "## Recently Added":
+                in_section = True
+                insert_at = i + 1
+            elif in_section:
+                if line.startswith("## "):
+                    insert_at = i
+                    break
+                insert_at = i + 1
+        for j, entry in enumerate(new_lines):
+            lines.insert(insert_at + j, entry)
+        index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    else:
+        section = "\n\n## Recently Added\n" + "\n".join(new_lines) + "\n"
+        index_path.write_text(text.rstrip() + section, encoding="utf-8")
+    return [slug for slug, _ in fresh]
+
+
 class LifecycleState:
     """Named constants for the 5-state lifecycle machine."""
     DRAFT        = "draft"
@@ -199,20 +241,10 @@ class WikiStorage:
         Also stamps categories: [Recently Added] on the page's own frontmatter.
         """
         index_path = self._root / "index.md"
-        if not index_path.exists():
-            return
-        raw = index_path.read_text(encoding="utf-8")
-        # Skip if this slug is already linked anywhere in the index
-        if f"[[{slug}]]" in raw or f"[[{slug}|" in raw:
-            return
-        entry = f"- [[{slug}]] — {title}"
-        if "## Recently Added" in raw:
-            raw = raw.rstrip() + f"\n{entry}\n"
-        else:
-            raw = raw.rstrip() + f"\n\n## Recently Added\n{entry}\n"
-        index_path.write_text(raw, encoding="utf-8")
-        # Stamp the page itself so it's queryable by category
-        self._add_category(slug, "Recently Added")
+        inserted = insert_index_entries(index_path, [(slug, title)])
+        # Stamp the page itself so it's queryable by category (only if added)
+        if slug in inserted:
+            self._add_category(slug, "Recently Added")
 
     def set_page_categories(self, slug: str, categories: list[str]) -> None:
         """Replace the categories list on a page's frontmatter (idempotent)."""

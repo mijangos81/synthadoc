@@ -160,31 +160,13 @@ def _page_title(path: Path) -> str:
 
 
 def _add_to_index(wiki_dir: Path, entries: list[tuple[str, str]]) -> None:
-    """Append [[slug]] — Title entries to index.md under ## Recently Added."""
-    index_path = wiki_dir / "index.md"
-    if not index_path.exists() or not entries:
-        return
-    text = index_path.read_text(encoding="utf-8")
-    new_lines = [f"- [[{slug}]] — {title}" for slug, title in entries]
-    if "## Recently Added" in text:
-        lines = text.splitlines()
-        insert_at = len(lines)
-        in_section = False
-        for i, line in enumerate(lines):
-            if line.strip() == "## Recently Added":
-                in_section = True
-                insert_at = i + 1
-            elif in_section:
-                if line.startswith("## "):
-                    insert_at = i
-                    break
-                insert_at = i + 1
-        for j, entry in enumerate(new_lines):
-            lines.insert(insert_at + j, entry)
-        index_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        section = "\n\n## Recently Added\n" + "\n".join(new_lines) + "\n"
-        index_path.write_text(text.rstrip() + section, encoding="utf-8")
+    """Append [[slug]] — Title entries to index.md under ## Recently Added.
+
+    Thin wrapper over the shared storage helper so the ingest path and the
+    candidates/promote path can never drift apart again.
+    """
+    from synthadoc.storage.wiki import insert_index_entries
+    insert_index_entries(wiki_dir / "index.md", entries)
 
 
 @candidates_app.command("promote")
