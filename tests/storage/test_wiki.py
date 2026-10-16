@@ -171,6 +171,25 @@ def test_append_to_index_creates_recently_added(tmp_wiki):
     assert "[[new-page]]" in content
 
 
+def test_write_page_normalizes_tags_to_valid_obsidian(tmp_wiki):
+    """Tags with spaces/punctuation are coerced to kebab-case on write, so
+    Obsidian does not render them as invalid (strikethrough) tags. Duplicates
+    after normalisation are dropped, order preserved; Unicode tags survive."""
+    store = WikiStorage(tmp_wiki / "wiki")
+    store.write_page("p", WikiPage(
+        title="P",
+        tags=["population genetics", "Ne/N ratio", "type I error", "population genetics", "中文"],
+        content="x", status="active", confidence="high", sources=[]))
+    raw = (tmp_wiki / "wiki" / "p.md").read_text(encoding="utf-8")
+    assert "- population-genetics" in raw
+    assert "- ne-n-ratio" in raw
+    assert "- type-i-error" in raw
+    assert raw.count("- population-genetics") == 1  # deduped after normalisation
+    page = store.read_page("p")
+    assert page is not None
+    assert page.tags == ["population-genetics", "ne-n-ratio", "type-i-error", "中文"]
+
+
 def test_concurrent_writes_to_different_pages(tmp_wiki):
     """Concurrent writes to different slugs must not interfere with each other."""
     store = WikiStorage(tmp_wiki / "wiki")
